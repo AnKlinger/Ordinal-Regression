@@ -1,0 +1,311 @@
+---
+title: "Ordinal Regression Thesis Seminar Task 4"
+author: "Andreas Klinger"
+date: "`r Sys.Date()`"
+output: html_document
+---
+# Simulating Data
+
+```{r}
+library(simdata)
+correlation_matrix = simdata::cor_from_upper(
+#  15, 
+  6,
+  rbind(c(1,2,0.8), 
+        c(3,5,0.3), 
+        c(4,6,-0.5)
+        #, 
+        #c(5,6,-0.3), c(5,12,0.5),c(4,7,-0.3),c(3,9,-0.5), 
+        #c(6,7,0.5), c(6,11,0.5), c(6,14,0.3), c(1,9,0.3), 
+        #c(7,11,0.3), c(7,14,0.3),
+        #c(8,9,-0.3), c(8,11,0.3),
+        #c(11,14,0.5)
+        ))
+
+transformation = simdata::function_list(
+  v1 = function(z) floor(10 * z[,1] + 55), 
+  v2 = function(z) z[,2] < 0.6, 
+  v3 = function(z) exp(0.4 * z[,3] + 3),
+  v4 = function(z) z[,4] >= -1.2,
+  v5 = function(z) z[,4] >= 0.75,
+  v6 = function(z) exp(0.5 * z[,5] + 1.5)
+  )
+
+sim_design = simdata::simdesign_mvtnorm(
+  relations = correlation_matrix,
+  transform_initial = transformation,
+  prefix_final = NULL
+)
+
+
+
+sim_data = simdata::simulate_data(sim_design, n_obs = 10000, seed = 25897165)
+
+summary(sim_data)
+
+hist(sim_data$v1)
+
+hist(sim_data$v3)
+
+hist(sim_data$v6)
+
+sds <- apply(sim_data, 2, sd)
+
+std_beta <- c(1.5, 1, 1, 0.75, 0.5, 0.25)
+
+beta <- std_beta/sds
+
+linpred <- as.matrix(sim_data) %*% beta
+
+hist(linpred)
+```
+## simulating negative binomial Y2
+```{r}
+mu <- exp((linpred-13)/sd(linpred))
+hist(log2(mu))
+
+y2 <- rnbinom(nrow(sim_data),mu=mu, size=mu^(1/4))
+
+hist(log2(y2+1), breaks=30, axes=F, xlab="y2 (count-type variable)", main="Barchart of y2")
+axis(1, at=log2((0:200)+1), labels=0:200)
+axis(2)
+```
+
+Negative Binomial Regression:
+
+```{r}
+library(MASS)
+
+df <- cbind(y2, sim_data)
+head(df)
+
+nb_model <- glm.nb(y2 ~ v1+v2+v3+v4+v5+v6, data = df)
+summary(nb_model)
+```
+Cumulative Link Model Ordinal Regression:
+
+```{r}
+library(rms) # need orm for cumulative logit model
+
+or_model <- orm(y2 ~ v1+v2+v3+v4+v5+v6, data = df)
+dd <- datadist(df)
+options(datadist="dd")
+summary(or_model)
+
+library(VGAM)
+
+# reverse TRUE means that the cumulative probabilities used are P(Y <= 1, P(Y <= 2), ...)
+
+# from documentation: With the logit link, setting parallel = FALSE will treat the response variable as ordinal and fit a
+# cumulative logit model
+
+temp <- df[df$y2 %in% c(0:10), ]
+
+or_model <- vglm(as.factor(y2) ~ v1+v2+v3+v4+v5+v6, data = temp,
+                 cumulative(link = "logitlink", parallel = FALSE, reverse = FALSE))
+summary(or_model)
+
+```
+# Defining Functions
+
+```{r}
+wrapper <- function(df, train, test) { # df is dataframe, train and test are subset dataframes, MASS and rms need to be loaded
+  
+  nb_model <- glm.nb(y2 ~ v1+v2+v3+v4+v5+v6, data = train)
+  or_model <- orm(y2 ~ v1+v2+v3+v4+v5+v6, data = train)
+  
+  nb_pred <- predict(nb_model, newdata = test)
+  or_pred <- predict(or_model, newdata = test)
+  
+  ci_nb_v2 <- confint(nb_model)[3,]
+  
+  temp <- confint(or_model)
+  ci_or_v2 <- temp[rownames(temp) == "v2"]
+  
+  
+  return(list(nb = nb_pred, or = or_pred, ci_nb_left = min(ci_nb_v2), ci_or_left = min(ci_or_v2)))
+  
+}
+
+performance.pred <- function(x, test) { # x are predictions of Y2, test is the test dataframe
+  
+  MSE <- mean((x-test$y2)^2)
+  return(MSE)
+  
+}
+
+performance.ci <- function(x) { # x should be the left side of the CI for v2
+  
+  return(ifelse(x > 0, TRUE, FALSE))
+  
+}
+
+combine.wrap.perf <- function(df) { # df is our dataframe, needs wrapper and performance
+  
+  n <- nrow(df)
+  
+  sample <- sample(c(TRUE, FALSE), n, replace=TRUE, prob=c(0.9,0.1)) # 90 - 10 Split
+  train  <- df[sample, ]
+  test   <- df[!sample, ]
+
+  temp <- wrapper(df, train, test)
+  
+  return(list(MSE_nb = performance.pred(temp$nb, test), MSE_or = performance.pred(temp$or, test),
+              ci_nb_bigger0 = performance.ci(temp$ci_nb_left), ci_or_bigger0 = performance.ci(temp$ci_or_left)))
+  
+}
+
+combine.wrap.perf(df)
+
+```
+# Simulation for Beta2 = 1
+
+```{r, results = "hide", message = FALSE}
+
+results <- data.frame(MSE_nb = rep(0, 1000), MSE_or = rep(0, 1000), MSE_or.divided_by.MSE_nb = rep(0, 1000),
+                      CI_nb_bigger0 = rep(FALSE, 1000), CI_or_bigger0 = rep(FALSE, 1000))
+
+for(i in 1:1000) {
+  
+  sim_data = simdata::simulate_data(sim_design, n_obs = 500) # no seed
+
+  sds <- apply(sim_data, 2, sd)
+
+  std_beta <- c(1.5, 1, 1, 0.75, 0.5, 0.25)
+
+  beta <- std_beta/sds
+
+  linpred <- as.matrix(sim_data) %*% beta
+
+
+  mu <- exp((linpred-13)/sd(linpred))
+
+  y2 <- rnbinom(nrow(sim_data),mu=mu, size=mu^(1/4))
+
+  df <- cbind(y2, sim_data)
+  
+  
+  
+  temp <- combine.wrap.perf(df)
+  
+  results[i,] <- c(temp$MSE_nb, temp$MSE_or, temp$MSE_or/temp$MSE_nb, temp$ci_nb_bigger0, temp$ci_or_bigger0)
+  
+}
+
+head(results)
+
+temp1 <- mean(results$MSE_or.divided_by.MSE_nb)
+temp2 <- mean(results$CI_nb_bigger0)
+temp3 <- mean(results$CI_or_bigger0)
+
+
+
+```
+
+```{r}
+paste0("The mean efficiency of the OR model (MSPE_or/MSPE_nb) is ", temp1)
+
+paste0("The percentage of simulated data sets where the 95% CI for Beta2 exclude 0 is ", temp2, " for the Negative Binomial Model and ", temp3, " for the Cumulative Ordinal Regression Model")
+```
+
+# Simulation for Beta2 = 0.5
+
+```{r, results = "hide", message = FALSE}
+
+results <- data.frame(MSE_nb = rep(0, 1000), MSE_or = rep(0, 1000), MSE_or.divided_by.MSE_nb = rep(0, 1000),
+                      CI_nb_bigger0 = rep(FALSE, 1000), CI_or_bigger0 = rep(FALSE, 1000))
+
+for(i in 1:50) {
+  
+  sim_data = simdata::simulate_data(sim_design, n_obs = 500) # no seed
+
+  sds <- apply(sim_data, 2, sd)
+
+  std_beta <- c(1.5, 0.5, 1, 0.75, 0.5, 0.25)
+
+  beta <- std_beta/sds
+
+  linpred <- as.matrix(sim_data) %*% beta
+
+
+  mu <- exp((linpred-13)/sd(linpred))
+
+  y2 <- rnbinom(nrow(sim_data),mu=mu, size=mu^(1/4))
+
+  df <- cbind(y2, sim_data)
+  
+  
+  
+  temp <- combine.wrap.perf(df)
+  
+  results[i,] <- c(temp$MSE_nb, temp$MSE_or, temp$MSE_or/temp$MSE_nb, temp$ci_nb_bigger0, temp$ci_or_bigger0)
+  
+}
+
+head(results)
+
+temp1 <- mean(results$MSE_or.divided_by.MSE_nb)
+temp2 <- mean(results$CI_nb_bigger0)
+temp3 <- mean(results$CI_or_bigger0)
+
+
+
+```
+
+```{r}
+paste0("The mean efficiency of the OR model (MSPE_or/MSPE_nb) is ", temp1)
+
+paste0("The percentage of simulated data sets where the 95% CI for Beta2 exclude 0 is ", temp2, " for the Negative Binomial Model and ", temp3, " for the Cumulative Ordinal Regression Model")
+```
+
+
+
+# Simulation for Beta2 = 0
+
+```{r, results = "hide", message = FALSE}
+
+results <- data.frame(MSE_nb = rep(0, 1000), MSE_or = rep(0, 1000), MSE_or.divided_by.MSE_nb = rep(0, 1000),
+                      CI_nb_bigger0 = rep(FALSE, 1000), CI_or_bigger0 = rep(FALSE, 1000))
+
+for(i in 1:1000) {
+  
+  sim_data = simdata::simulate_data(sim_design, n_obs = 500) # no seed
+
+  sds <- apply(sim_data, 2, sd)
+
+  std_beta <- c(1.5, 0, 1, 0.75, 0.5, 0.25)
+
+  beta <- std_beta/sds
+
+  linpred <- as.matrix(sim_data) %*% beta
+
+
+  mu <- exp((linpred-13)/sd(linpred))
+
+  y2 <- rnbinom(nrow(sim_data),mu=mu, size=mu^(1/4))
+
+  df <- cbind(y2, sim_data)
+  
+  
+  
+  temp <- combine.wrap.perf(df)
+  
+  results[i,] <- c(temp$MSE_nb, temp$MSE_or, temp$MSE_or/temp$MSE_nb, temp$ci_nb_bigger0, temp$ci_or_bigger0)
+  
+}
+
+head(results)
+
+temp1 <- mean(results$MSE_or.divided_by.MSE_nb)
+temp2 <- mean(results$CI_nb_bigger0)
+temp3 <- mean(results$CI_or_bigger0)
+
+
+
+```
+
+```{r}
+paste0("The mean efficiency of the OR model (MSPE_or/MSPE_nb) is ", temp1)
+
+paste0("The percentage of simulated data sets where the 95% CI for Beta2 exclude 0 is ", temp2, " for the Negative Binomial Model and ", temp3, " for the Cumulative Ordinal Regression Model")
+```
